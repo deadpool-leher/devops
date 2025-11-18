@@ -1,36 +1,20 @@
 pipeline {
     agent any
-    options { timestamps() }
-
-    triggers {
-        // Webhook GitHub (utama)
-        githubPush()
-        // Fallback polling SCM setiap ~2 menit
-        pollSCM('H/2 * * * *')
+    options {
+        timestamps()
+        // agar log lebih rapi
     }
 
     environment {
-        // >>> GANTI BAGIAN INI <<<
-        // Nama file Python monitor khusus teman kamu
+        // Ganti nama script jika di repo bernama lain, atau set di Jenkins job
         SCRIPT_FILE = "monitor.py"
-
-        // Token Fonnte teman kamu
-        FONNTE_TOKEN = "qgYnAhKSR8NtymzySksJ"
-
-        // Nomor WhatsApp target Fonnte (bisa lebih dari 1, pisahkan dengan koma)
-        FONNTE_TARGETS = "628998273221"
-
-        // API Key Gemini milik teman kamu
-        GEMINI_API_KEY = "AIzaSyAT1MTSTk_MJKusvNrJH8T0LOJY0GQCsb8"
-        GEMINI_MODEL = "gemini-2.5-flash"
+        VENV_DIR = ".venv"
     }
-pipeline {
-    agent any
-    options { timestamps() }
 
     stages {
         stage('Checkout') {
             steps {
+                echo "[GIT] Checkout repository..."
                 checkout scm
             }
         }
@@ -38,50 +22,77 @@ pipeline {
         stage('Setup virtualenv & deps') {
             steps {
                 echo "[SETUP] Membuat virtual environment jika belum ada, lalu install deps..."
-                // Pastikan menggunakan bash (beberapa node default sh tidak punya 'source' behaviour yang sama)
                 sh '''
                     set -e
-                    # cek python3 ada
+                    echo "Working dir: $(pwd)"
+                    echo "List files:"
+                    ls -la
+
+                    # cek python3
                     if ! command -v python3 >/dev/null 2>&1; then
-                        echo "python3 tidak ditemukan. Install dulu atau gunakan node agent lain."
+                        echo "ERROR: python3 tidak ditemukan pada agent. Install python3 atau gunakan agent lain."
                         exit 1
                     fi
 
                     # buat venv jika belum ada
-                    if [ ! -d ".venv" ]; then
-                        echo "Membuat .venv..."
-                        python3 -m venv .venv
+                    if [ ! -d "${VENV_DIR}" ]; then
+                        echo "Membuat ${VENV_DIR}..."
+                        python3 -m venv ${VENV_DIR}
                     else
-                        echo ".venv sudah ada, melewatkan pembuatan."
+                        echo "${VENV_DIR} sudah ada, melewatkan pembuatan."
                     fi
 
-                    # aktifkan venv untuk perintah berikutnya dalam skrip ini
-                    # gunakan '.' agar kompatibel, tapi pastikan file activate benar-benar ada
-                    if [ -f .venv/bin/activate ]; then
-                        . .venv/bin/activate
-                    else
-                        echo "ERROR: .venv/bin/activate tidak ditemukan setelah pembuatan venv."
+                    # cek file activate
+                    if [ ! -f "${VENV_DIR}/bin/activate" ]; then
+                        echo "ERROR: ${VENV_DIR}/bin/activate tidak ditemukan setelah pembuatan venv."
                         exit 1
                     fi
 
-                    # upgrade pip dan install requirement bila ada
-                    pip install --upgrade pip
+                    # aktifkan venv untuk perintah berikut di blok sh ini
+                    . ${VENV_DIR}/bin/activate
+
+                    # upgrade pip dan install requirements jika ada
+                    pip install --upgrade pip setuptools wheel
+
                     if [ -f requirements.txt ]; then
+                        echo "Menginstall dependencies dari requirements.txt..."
                         pip install -r requirements.txt
                     else
-                        echo "requirements.txt tidak ditemukan, melewatkan install deps."
+                        echo "requirements.txt tidak ditemukan — melewatkan install deps."
                     fi
+
+                    # tunjukkan pip list singkat
+                    pip --version || true
+                    pip list --format=columns | sed -n '1,20p' || true
                 '''
             }
         }
 
-        stage('Run monitor') {
+        stage('Run script') {
             steps {
+                echo "[RUN] Menjalankan script Python..."
+                // setiap sh invocation baru harus activate venv lagi
                 sh '''
                     set -e
-                    . .venv/bin/activate
-                    # jalankan skrip monitor (sesuaikan nama file di environment/SCRIPT_FILE)
-                    python3 ${SCRIPT_FILE}
+                    if [ ! -f "${VENV_DIR}/bin/activate" ]; then
+                        echo "ERROR: ${VENV_DIR}/bin/activate tidak ada. Pastikan stage Setup berjalan sukses."
+                        exit 1
+                    fi
+
+                    . ${VENV_DIR}/bin/activate
+
+                    echo "Menjalankan: python3 ${SCRIPT_FILE}"
+                    if [ ! -f "${SCRIPT_FILE}" ]; then
+                        echo "WARNING: ${SCRIPT_FILE} tidak ditemukan di workspace. Cek nama file."
+                        exit 1
+                    fi
+
+                    # contoh menjalankan, redirect log ke file agar bisa diarsipkan
+                    python3 ${SCRIPT_FILE} > monitor.log 2>&1 || {
+                        echo "Script keluar dengan kode error: $?"
+                        # tetap arsipkan log untuk debugging
+                        exit 1
+                    }
                 '''
             }
         }
@@ -89,130 +100,22 @@ pipeline {
 
     post {
         always {
-            echo "[POST] Arsipkan log..."
-            archiveArtifacts artifacts: 'monitorTeman.log,monitorTeman.pid', allowEmptyArchive: true
+            echo "[POST] Mengarsipkan artefak dan menunjukkan beberapa info..."
+            sh 'echo "Build finished at: $(date)"'
+            // arsip log dan file lain bila ada
+            archiveArtifacts artifacts: 'monitor.log,*.log', allowEmptyArchive: true
+            // tampilkan beberapa baris log agar mudah debugging di job console
+            sh '''
+                echo "---- tail monitor.log (up to 200 lines) ----"
+                if [ -f monitor.log ]; then
+                    tail -n 200 monitor.log || true
+                else
+                    echo "monitor.log tidak ada."
+                fi
+            '''
         }
-    }
-}
-
-    stages {
-        stage('Checkout') {
-            steps {
-                echo "[CHECKOUT] Ambil source code dari repo..."
-                checkout scm
-                sh 'ls -a | grep "$SCRIPT_FILE" || echo "[CHECKOUT] $SCRIPT_FILE tidak ditemukan di repo!"'
-            }
+        failure {
+            echo "[POST] Build gagal — cek console output dan monitor.log"
         }
-
-        stage('Setup Python') {
-            steps {
-                sh '''
-                    set -e
-                    echo "[SETUP] Membuat virtual environment..."
-                    if [ ! -d .venv ]; then
-                        python3 -m venv .venv
-                    fi
-                    . .venv/bin/activate
-                    pip install --upgrade pip
-                    pip install requests google-generativeai python-dotenv
-                '''
-            }
-        }
-
-        stage('Notify WhatsApp CI Start') {
-            steps {
-                sh '''
-                    . .venv/bin/activate
-                    python - << 'PY'
-import os, socket, datetime, requests
-HOSTNAME = socket.gethostname()
-ts = datetime.datetime.now().isoformat()
-msg = f"[BotTeman] Jenkins build monitorTeman.py dimulai di {HOSTNAME} @ {ts}."
-
-# Cek koneksi Gemini
-try:
-    import google.generativeai as genai
-    genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
-    model = genai.GenerativeModel(os.getenv('GEMINI_MODEL', 'gemini-2.5-flash'))
-    resp = model.generate_content("beri dua kata kalau Gemini aktif.")
-    if getattr(resp, 'text', ''):
-        msg += "\\nGemini OK: " + getattr(resp, 'text', '').strip()
-except Exception as e:
-    msg += f"\\nGemini gagal: {e}"
-
-# Kirim pesan ke Fonnte
-token = os.getenv("FONNTE_TOKEN")
-targets = [t.strip() for t in os.getenv("FONNTE_TARGETS", "").split(',') if t.strip()]
-for t in targets:
-    try:
-        r = requests.post(
-            "https://api.fonnte.com/send",
-            headers={"Authorization": token},
-            data={"target": t, "message": msg},
-            timeout=10
-        )
-        print(f"Fonnte {t} {r.status_code}")
-    except Exception as e:
-        print("Fonnte error", e)
-PY
-                '''
-            }
-        }
-
-        stage('Run Monitor') {
-            steps {
-                sh '''
-                    set -e
-                    LOG_FILE="$(pwd)/monitorTeman.log"
-                    PID_FILE="$(pwd)/monitorTeman.pid"
-                    echo "[RUN] Menjalankan $SCRIPT_FILE..."
-
-                    if [ ! -f "$SCRIPT_FILE" ]; then
-                        echo "[RUN] FAIL: $SCRIPT_FILE tidak ditemukan!"
-                        exit 1
-                    fi
-
-                    # Hentikan instance lama
-                    if [ -f "$PID_FILE" ]; then
-                        OLD=$(cat "$PID_FILE" || true)
-                        if [ -n "$OLD" ] && kill -0 "$OLD" 2>/dev/null; then
-                            echo "[RUN] Stop monitor lama ($OLD)..."
-                            kill "$OLD" || true
-                            sleep 1
-                        fi
-                    fi
-
-                    export BUILD_ID=dontKillMe
-                    export JENKINS_NODE_COOKIE=dontKillMe
-
-                    # Hentikan proses lama lain
-                    pkill -f "$SCRIPT_FILE" 2>/dev/null || true
-                    sleep 1
-
-                    echo "[RUN] Python: $(.venv/bin/python -V)"
-                    RUNNER=".venv/bin/python -u \"$SCRIPT_FILE\""
-                    nohup setsid bash -c "$RUNNER" > "$LOG_FILE" 2>&1 < /dev/null &
-                    echo $! > "$PID_FILE"
-
-                    sleep 2
-                    if ps -p $(cat "$PID_FILE") >/dev/null 2>&1; then
-                        echo "[RUN] OK: $SCRIPT_FILE berjalan (PID=$(cat "$PID_FILE"))"
-                    else:
-                        echo "[RUN] FAIL: Gagal menjalankan $SCRIPT_FILE"
-                        tail -n 200 "$LOG_FILE" || true
-                        exit 1
-                    fi
-                '''
-            }
-        }
-    }
-
-    post {
-        always {
-            echo "[POST] Arsipkan log..."
-            archiveArtifacts artifacts: 'monitorTeman.log,monitorTeman.pid', allowEmptyArchive: true
-        }
-        success { echo "[POST] Build sukses." }
-        failure { echo "[POST] Build gagal." }
     }
 }
