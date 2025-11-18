@@ -24,6 +24,76 @@ pipeline {
         GEMINI_API_KEY = "AIzaSyAT1MTSTk_MJKusvNrJH8T0LOJY0GQCsb8"
         GEMINI_MODEL = "gemini-2.5-flash"
     }
+pipeline {
+    agent any
+    options { timestamps() }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Setup virtualenv & deps') {
+            steps {
+                echo "[SETUP] Membuat virtual environment jika belum ada, lalu install deps..."
+                // Pastikan menggunakan bash (beberapa node default sh tidak punya 'source' behaviour yang sama)
+                sh '''
+                    set -e
+                    # cek python3 ada
+                    if ! command -v python3 >/dev/null 2>&1; then
+                        echo "python3 tidak ditemukan. Install dulu atau gunakan node agent lain."
+                        exit 1
+                    fi
+
+                    # buat venv jika belum ada
+                    if [ ! -d ".venv" ]; then
+                        echo "Membuat .venv..."
+                        python3 -m venv .venv
+                    else
+                        echo ".venv sudah ada, melewatkan pembuatan."
+                    fi
+
+                    # aktifkan venv untuk perintah berikutnya dalam skrip ini
+                    # gunakan '.' agar kompatibel, tapi pastikan file activate benar-benar ada
+                    if [ -f .venv/bin/activate ]; then
+                        . .venv/bin/activate
+                    else
+                        echo "ERROR: .venv/bin/activate tidak ditemukan setelah pembuatan venv."
+                        exit 1
+                    fi
+
+                    # upgrade pip dan install requirement bila ada
+                    pip install --upgrade pip
+                    if [ -f requirements.txt ]; then
+                        pip install -r requirements.txt
+                    else
+                        echo "requirements.txt tidak ditemukan, melewatkan install deps."
+                    fi
+                '''
+            }
+        }
+
+        stage('Run monitor') {
+            steps {
+                sh '''
+                    set -e
+                    . .venv/bin/activate
+                    # jalankan skrip monitor (sesuaikan nama file di environment/SCRIPT_FILE)
+                    python3 ${SCRIPT_FILE}
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "[POST] Arsipkan log..."
+            archiveArtifacts artifacts: 'monitorTeman.log,monitorTeman.pid', allowEmptyArchive: true
+        }
+    }
+}
 
     stages {
         stage('Checkout') {
