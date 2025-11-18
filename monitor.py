@@ -1,163 +1,155 @@
-#!/usr/bin/env python3
 import os
-import re
 import time
-import socket
-import logging
 import requests
-import concurrent.futures
+import logging
+import socket
 import subprocess
+import json
+import traceback
 import threading
-from collections import defaultdict, deque
-from datetime import datetime, timezone
-from typing import Iterator
+from datetime import datetime
 import sys
-import atexit
 
-# ==========================================================
-# 🧩 LOCK FILE: agar tidak bentrok dengan BotFajri
-# ==========================================================
-LOCK_FILE = "/tmp/ssh_monitor_teman.lock"
+# ==== KONFIGURASI ====
+MONITOR_PID_FILE = "monitorTeman.pid"
+MONITOR_LOG_FILE = "monitorTeman.log"
+LOCK_FILE = "monitorTeman.lock"
+CHECK_INTERVAL = 3  # detik
+MAX_RETRY = 5  # batas retry pada error jaringan
+LOG_PATHS = ["/var/log/auth.log", "/var/log/secure"]  # file log SSH Linux
+IGNORE_USERS = ["root", "Ubuntu"]  # User yang boleh diabaikan
+FONNTE_TOKEN = "qgYnAhKSR8NtymzySksJ"  # Token Fonnte
+ADMIN_NUMBER = "628998273221"  # Nomor tujuan pesan
 
-if os.path.exists(LOCK_FILE):
-    print(f"⚠️  Monitor teman sudah berjalan (lock file: {LOCK_FILE}). Keluar.")
-    sys.exit(0)
+# ==== SETUP LOGGING ====
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
 
-with open(LOCK_FILE, "w") as f:
-    f.write(str(os.getpid()))
+def ensure_log_file():
+    """Pastikan FileHandler aktif agar error selalu masuk ke monitor.log."""
+    handler_exists = any(
+        isinstance(h, logging.FileHandler) for h in logging.getLogger().handlers
+    )
+    if not handler_exists:
+        fh = logging.FileHandler(MONITOR_LOG_FILE)
+        fh.setLevel(logging.INFO)
+        formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+        fh.setFormatter(formatter)
+        logging.getLogger().addHandler(fh)
 
-@atexit.register
-def cleanup():
-    if os.path.exists(LOCK_FILE):
-        os.remove(LOCK_FILE)
+ensure_log_file()
 
-# ==========================================================
-# Konfigurasi utama (ubah bagian ini sesuai user temanmu)
-# ==========================================================
-HOSTNAME = socket.gethostname()
+def tail_file(path):
+    """Generator untuk membaca baris baru dari file log."""
+    try:
+        with open(path, "r", errors="ignore") as f:
+            f.seek(0, os.SEEK_END)
+            while True:
+                line = f.readline()
+                if not line:
+                    time.sleep(0.5)
+                    continue
+                yield line.strip()
+    except Exception:
+        logging.exception(f"ERROR membaca file log: {path}")
 
-# >>> GANTI BAGIAN INI <<<
-FONNTE_TOKEN = "qgYnAhKSR8NtymzySksJ"
-FONNTE_TARGETS = ["628998273221"]
+def send_fonnte_message(text):
+    """Mengirim pesan via API Fonnte."""
+    url = "https://api.fonnte.com/send"
+    payload = {
+        "target": ADMIN_NUMBER,
+        "message": text,
+    }
+    headers = {
+        "Authorization": FONNTE_TOKEN,
+    }
+    retry = 0
+    while retry < MAX_RETRY:
+        try:
+            r = requests.post(url, data=payload, headers=headers, timeout=10)
+            if r.status_code == 200:
+                logging.info(f"[FONNTE] Pesan terkirim: {text}")
+                return True
+            else:
+                logging.warning(f"[FONNTE] Gagal ({r.status_code}): {r.text}")
+        except Exception:
+            logging.exception("[FONNTE] ERROR saat mengirim pesan")
+        retry += 1
+        time.sleep(2)
+    return False
 
-GEMINI_API_KEY = "AIzaSyAT1MTSTk_MJKusvNrJH8T0LOJY0GQCsb8"
-GEMINI_MODEL = "gemini-2.5-flash"
-
-BOT_NAME = "Bot"  # nama bot untuk pesan WhatsApp
-
-LOG_PATHS = ["/var/log/auth.log", "/var/log/secure"]
-POLL_INTERVAL = 1.0
-FAIL_WINDOW_SEC = 300
-SUCCESS_WINDOW_SEC = 300
-FAIL_THRESHOLD = 5
-SUCCESS_THRESHOLD = 2
-ALERT_SESSION_OPEN = False
-
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s %(levelname)s %(message)s")
-
-RE_SUCCESS = re.compile(r"Accepted\s+(?P<method>\S+)\s+for\s+(?P<user>\S+)\s+from\s+(?P<ip>\S+)", re.IGNORECASE)
-RE_FAIL = re.compile(r"Failed\s+password\s+for\s+(?:invalid user\s+)?(?P<user>\S+)\s+from\s+(?P<ip>\S+)", re.IGNORECASE)
-
-def utc_now_iso(): return datetime.now(timezone.utc).isoformat()
-
-def analyze_with_gemini(summary: str) -> str | None:
+def analyze_with_gemini(text):
+    """Analisis pesan login menggunakan Gemini (opsional)."""
     try:
         import google.generativeai as genai
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        prompt = (
-            f"Nama kamu {BOT_NAME}. Analisis singkat untuk: {summary}. "
-            "Gunakan format:\n*Tingkat Risiko:* <Low|Medium|High>\n*Alasan:* <1-3 kalimat>"
-        )
-        resp = model.generate_content(prompt)
-        return getattr(resp, 'text', '').strip() or None
-    except Exception as e:
-        logging.warning("Gemini gagal: %s", e)
-        return None
-
-def send_fonnte_message(msg: str):
-    for t in FONNTE_TARGETS:
-        try:
-            r = requests.post("https://api.fonnte.com/send",
-                headers={"Authorization": FONNTE_TOKEN},
-                data={"target": t, "message": msg},
-                timeout=10)
-            logging.info("Fonnte %s: %s", t, r.status_code)
-        except Exception as e:
-            logging.warning("Fonnte error ke %s: %s", t, e)
-
-def gemini_with_timeout(summary: str, timeout=6.0) -> str | None:
-    def _call(): return analyze_with_gemini(summary)
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            return ex.submit(_call).result(timeout=timeout)
+        genai.configure(api_key=GEMINI_API)
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        result = model.generate_content(f"Analisis keamanan: {text}")
+        return result.text
     except Exception:
+        logging.warning("[GEMINI] Analisis gagal (opsional).")
         return None
 
-def parse_event(line: str):
-    now = utc_now_iso()
-    m = RE_SUCCESS.search(line)
-    if m:
-        return {"ts": now, "type": "login_success", "user": m["user"], "ip": m["ip"], "method": m["method"]}
-    m = RE_FAIL.search(line)
-    if m:
-        return {"ts": now, "type": "login_fail", "user": m["user"], "ip": m["ip"]}
-    return None
+def monitor_logs():
+    """Memonitor file log SSH."""
+    logging.info("[MONITOR] Monitoring log SSH dimulai...")
 
-def tail_file(path: str):
-    pos = None; init = False
+    paths = [p for p in LOG_PATHS if os.path.exists(p)]
+    logging.info(f"[MONITOR] Log yang ditemukan: {paths}")
+
+    if not paths:
+        logging.error("[MONITOR] Tidak ada file log SSH ditemukan!")
+        return
+
+    tails = [tail_file(p) for p in paths]
+
+    for tail in tails:
+        threading.Thread(target=lambda t=tail: process_log_stream(t), daemon=True).start()
+
     while True:
-        try:
-            with open(path, "r", errors="ignore") as f:
-                if not init:
-                    f.seek(0, os.SEEK_END)
-                    pos = f.tell()
-                    init = True
-                else:
-                    f.seek(pos)
-                chunk = f.read()
-                if chunk:
-                    pos = f.tell()
-                    for line in chunk.splitlines():
-                        yield line
-        except FileNotFoundError:
-            pass
-        time.sleep(POLL_INTERVAL)
-        yield None
+        time.sleep(1)
 
-def format_msg(event, analysis: str | None = None) -> str:
-    base = f"[{BOT_NAME}] Host: {HOSTNAME}\nUser: {event['user']}\nIP: {event['ip']}\nType: {event['type']}\nTime: {event['ts']}"
-    base += "\n\nAnalisis BotTeman:\n" + (analysis or "-")
-    return base
+def process_log_stream(tailer):
+    """Proses tiap baris log."""
+    for line in tailer:
+        if any(user in line for user in IGNORE_USERS):
+            continue
+
+        if "Accepted password" in line or "session opened" in line:
+            send_fonnte_message(f"[LOGIN] Masuk SSH: {line}")
+
+        if "Failed password" in line:
+            send_fonnte_message(f"[FAILED] Gagal SSH: {line}")
 
 def main():
-    logging.info(f"[{BOT_NAME}] Mulai monitor log SSH...")
-    ip_fail = defaultdict(deque)
-    last_sent = {}
-    DEDUP_TTL_SEC = 60
-    paths = [p for p in LOG_PATHS if os.path.exists(p)]
-    tails = [(p, tail_file(p)) for p in paths]
+    logging.info("[BotTeman] Monitoring Aktif...")
+    monitor_logs()
 
-    while True:
-        for _, gen in tails:
-            line = next(gen, None)
-            if not line: continue
-            evt = parse_event(line)
-            if not evt: continue
-
-            key = (evt["type"], evt.get("user"), evt.get("ip"))
-            now = time.time()
-            if last_sent.get(key, 0) + DEDUP_TTL_SEC > now:
-                continue
-
-            summary = f"{evt['type']} user={evt['user']} ip={evt['ip']} host={HOSTNAME}"
-            analysis = gemini_with_timeout(summary)
-            msg = format_msg(evt, analysis)
-            send_fonnte_message(msg)
-            last_sent[key] = now
-
+# =============================
+#         ENTRY POINT
+# =============================
 if __name__ == "__main__":
-    logging.info("[BotTeman] start")
-    threading.Thread(target=lambda: send_fonnte_message(f"[BotTeman] monitor aktif di {socket.gethostname()}"), daemon=True).start()
-    main()
+    logging.info("[BotTeman] Start program monitor.")
+
+    # Kirim pesan startup (tidak boleh membuat crash)
+    try:
+        threading.Thread(
+            target=lambda: send_fonnte_message(
+                f"[BotTeman] Monitor aktif di {socket.gethostname()}"
+            ),
+            daemon=True,
+        ).start()
+    except Exception:
+        logging.exception("ERROR mengirim pesan startup")
+
+    # Jalankan main() dengan try/except agar error tercatat
+    try:
+        main()
+    except Exception as e:
+        logging.error("=== ERROR FATAL PADA monitor.py ===")
+        logging.exception(e)
+        print("\n=========================\nERROR FATAL TERJADI!\n=========================")
+        traceback.print_exc()
+        sys.exit(1)
