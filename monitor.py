@@ -22,8 +22,8 @@ PID_FILE = "monitorTeman.pid"
 LOG_FILE = "monitorTeman.log"
 LOG_PATHS = ["/var/log/auth.log", "/var/log/secure"]  # Ubuntu / CentOS
 CHECK_INTERVAL = 1.0  # detik tunggu saat baca tail
-FONNTE_TOKEN = os.environ.get("FONNTE_TOKEN", "tjKKtd2kut6qw4fGK1sr")
-ADMIN_NUMBER = os.environ.get("ADMIN_NUMBER", "08998273221")
+FONNTE_TOKEN = os.environ.get("FONNTE_TOKEN", "SiR6fy5rC3Uup9prXrQD")
+ADMIN_NUMBER = os.environ.get("ADMIN_NUMBER", "085696176511")
 IGNORE_USERS = set(["root"])  # user yang diabaikan (opsional)
 SEND_RETRY = 3
 # --------------------------
